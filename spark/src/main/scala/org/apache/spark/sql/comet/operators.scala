@@ -1866,6 +1866,19 @@ case class CometUnionExec(
 trait CometBaseAggregate {
 
   /**
+   * Serialize each aggregate function so a current-conversion failure is recorded by the active
+   * fallback-reason capture. The proto result is discarded; callers have already decided to fall
+   * back and only need the reasons `aggExprToProto` writes.
+   */
+  private def recordAggregateExpressionFallbackReasons(aggregate: BaseAggregateExec): Unit = {
+    val output = aggregate.child.output
+    aggregate.aggregateExpressions.foreach { aggExpr =>
+      val binding = aggExpr.mode != PartialMerge && aggExpr.mode != Final
+      aggExprToProto(aggExpr, output, binding, aggregate.conf)
+    }
+  }
+
+  /**
    * Whether a decimal SUM's result precision is DecimalType.MAX_PRECISION, the only case with no
    * headroom above the input where an intermediate overflow can change the answer.
    */
@@ -1916,6 +1929,13 @@ trait CometBaseAggregate {
           "Comet aggregate that merges intermediate buffers requires a Comet child aggregate " +
             "when the intermediate buffer formats are incompatible with Spark. " +
             s"Incompatible aggregate function(s): $names")
+        // This return is before `aggExprToProto`. A more specific function reason, such as
+        // listagg's collation rejection, may already sit on the aggregate function from
+        // `canAggregateBeConverted`, which runs outside this conversion's write capture.
+        // Re-run serialization here so that reason is a write in the current capture and
+        // `rollUpFallbackReasons` can publish it. Scanning leftover expression tags would
+        // also pick up stale reasons on shared nodes. See #5499.
+        recordAggregateExpressionFallbackReasons(aggregate)
         return None
       }
     }
