@@ -524,6 +524,9 @@ class CometCodegenSuite
     // very singleton, so before https://github.com/apache/datafusion-comet/issues/5229 the
     // operator reported a name and an info message belonging to some unrelated query.
     val planted = Literal.TrueLiteral
+    val previousInfo = planted.getTagValue(CometExplainInfo.EXTENSION_INFO)
+    val previousNative = planted.getTagValue(CometExplainInfo.NATIVE_EXPRS)
+    val previousDispatch = planted.getTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
     planted.setTagValue(CometExplainInfo.EXTENSION_INFO, Set("PLANTED_INFO"))
     planted.setTagValue(CometExplainInfo.NATIVE_EXPRS, Set("plantedexpr"))
     planted.setTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS, Set("planteddispatch"))
@@ -568,9 +571,52 @@ class CometCodegenSuite
         }
       }
     } finally {
-      planted.unsetTagValue(CometExplainInfo.EXTENSION_INFO)
-      planted.unsetTagValue(CometExplainInfo.NATIVE_EXPRS)
-      planted.unsetTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
+      previousInfo match {
+        case Some(values) => planted.setTagValue(CometExplainInfo.EXTENSION_INFO, values)
+        case None => planted.unsetTagValue(CometExplainInfo.EXTENSION_INFO)
+      }
+      previousNative match {
+        case Some(values) => planted.setTagValue(CometExplainInfo.NATIVE_EXPRS, values)
+        case None => planted.unsetTagValue(CometExplainInfo.NATIVE_EXPRS)
+      }
+      previousDispatch match {
+        case Some(values) =>
+          planted.setTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS, values)
+        case None => planted.unsetTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
+      }
+    }
+  }
+
+  test("decimal rewrite fallback lift ignores stale reasons on shared TrueLiteral") {
+    val planted = Literal.TrueLiteral
+    val previous = planted.getTagValue(CometExplainInfo.FALLBACK_REASONS)
+    val staleReason = "PLANTED_STALE_FALLBACK_REASON"
+    planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, Set(staleReason))
+    try {
+      // Decimal promotion rebuilds the tree around Add. Disabling Add makes conversion fail only
+      // after serde has visited the shared literal, which used to let its historical tag get swept
+      // into the copy-back onto the original Alias.
+      val decimal = AttributeReference("amount", DecimalType(10, 2), nullable = false)()
+      val projection = Alias(
+        CreateNamedStruct(Seq(Literal("flag"), planted, Literal("sum"), Add(decimal, decimal))),
+        "value")()
+      val key = CometConf.getExprEnabledConfigKey("Add")
+      withSQLConf(key -> "false") {
+        assert(QueryPlanSerde.exprToProto(projection, Seq(decimal)).isEmpty)
+      }
+
+      val reasons = projection
+        .getTagValue(CometExplainInfo.FALLBACK_REASONS)
+        .getOrElse(Set.empty[String])
+      assert(
+        reasons.exists(_.contains(key)),
+        s"expected the current disabled-Add reason on the original owner, got: $reasons")
+      assert(!reasons.contains(staleReason), s"stale singleton reason was lifted: $reasons")
+    } finally {
+      previous match {
+        case Some(values) => planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, values)
+        case None => planted.unsetTagValue(CometExplainInfo.FALLBACK_REASONS)
+      }
     }
   }
 

@@ -869,18 +869,32 @@ case class CometExecRule(session: SparkSession)
 
   /** Convert a Spark plan to a Comet plan using the specified serde handler */
   private def convertToComet(op: SparkPlan, handler: CometOperatorSerde[_]): Option[SparkPlan] = {
-    val converted = tryConvertToComet(op, handler)
+    val conversionNodes = op +: op.expressions.flatMap(_.collect { case e: Expression => e })
+    val (converted, currentFallbackReasons) = captureFallbackReasons(conversionNodes) {
+      tryConvertToComet(op, handler)
+    }
     if (converted.isEmpty) {
-      // Comet looked at this operator and declined it, so it stays in the Spark plan. Lift any
-      // reasons recorded on its expressions onto the operator itself - see
-      // `rollUpFallbackReasons` for why this is needed - and then make sure something was
-      // recorded. The order is required, not incidental: `reportUnexplainedFallback` inspects only
-      // the operator's own tag, so a reason still sitting on an expression would look like no
-      // reason at all and trip the strict check.
-      rollUpFallbackReasons(op)
-      reportUnexplainedFallback(op)
+      handleConversionFailure(op, currentFallbackReasons)
     }
     converted
+  }
+
+  /**
+   * Finish a failed operator conversion by publishing only reasons written during that attempt,
+   * then enforcing the unexplained-fallback contract. Package-visible for provenance regression
+   * tests that must construct a deliberately silent serde result.
+   */
+  private[comet] def handleConversionFailure(
+      op: SparkPlan,
+      currentFallbackReasons: Set[String]): Unit = {
+    // Comet looked at this operator and declined it, so it stays in the Spark plan. Lift any
+    // reasons recorded on its expressions onto the operator itself - see
+    // `rollUpFallbackReasons` for why this is needed - and then make sure something was
+    // recorded. The order is required, not incidental: `reportUnexplainedFallback` inspects only
+    // the operator's own tag, so a reason still sitting on an expression would look like no
+    // reason at all and trip the strict check.
+    rollUpFallbackReasons(op, currentFallbackReasons)
+    reportUnexplainedFallback(op)
   }
 
   private def tryConvertToComet(
@@ -938,7 +952,7 @@ case class CometExecRule(session: SparkSession)
   }
 
   /**
-   * Lift fallback reasons recorded on `op`'s expression trees onto `op` itself.
+   * Lift fallback reasons written while attempting to convert `op` onto `op` itself.
    *
    * Extended explain output only walks plan nodes (`ExtendedExplainInfo.sortup` follows
    * `children` / `innerChildren`, never `expressions`), so a reason tagged on an expression is
@@ -947,22 +961,15 @@ case class CometExecRule(session: SparkSession)
    * used to be hand-written at every serde call site (see
    * https://github.com/apache/datafusion-comet/issues/5230).
    *
-   * Only child *expressions* are collected, not child operators: reasons on a child operator are
-   * already reachable by the explain traversal via `children`.
-   *
-   * Called only when `op` was left in the Spark plan, which scopes the roll-up to the operator
-   * that actually failed conversion. That matters because some expression instances
-   * (`AttributeReference`s, DPP subquery expressions) are shared across operators, so an unscoped
-   * roll-up could surface one expression's reason under several unrelated operators.
+   * The input comes from the conversion-local write capture around [[tryConvertToComet]], not a
+   * descendant tag scan. Some Catalyst expressions, including literals, are shared across plans
+   * and can retain tags from earlier queries. Those historical values must not explain this
+   * operator's fallback, while a literal reason genuinely written during this conversion must.
+   * Coverage-only structural filters cannot make that distinction. See #5499.
    *
    * [[reportUnexplainedFallback]] relies on this having run first; the two must not be separated.
    */
-  private def rollUpFallbackReasons(op: SparkPlan): Unit = {
-    val reasons = op.expressions
-      .flatMap(_.collect { case e: Expression => e })
-      .flatMap(_.getTagValue(CometExplainInfo.FALLBACK_REASONS))
-      .flatten
-      .toSet
+  private def rollUpFallbackReasons(op: SparkPlan, reasons: Set[String]): Unit = {
     if (reasons.nonEmpty) {
       withFallbackReasons(op, reasons)
     }
@@ -972,17 +979,18 @@ case class CometExecRule(session: SparkSession)
    * Handle an operator that Comet declined without stating why.
    *
    * When every child is already native, Comet had a real opportunity to convert `op`, so the
-   * absence of any reason - on `op` or anywhere in its expression trees - means a serde returned
-   * `None` and forgot to record one. Under `COMET_STRICT_FALLBACK_REASONS` (enabled for Comet's
-   * own test suites) that is a hard failure; otherwise fall back to a generic message so users
-   * still see something. The generic message is what used to mask this whole class of bug, which
-   * is why the strict check exists.
+   * absence of an operator reason after the conversion-local write set has been rolled up means a
+   * serde returned `None` and forgot to record one. Historical descendant tags are deliberately
+   * excluded. Under `COMET_STRICT_FALLBACK_REASONS` (enabled for Comet's own test suites) that is
+   * a hard failure; otherwise fall back to a generic message so users still see something. The
+   * generic message is what used to mask this whole class of bug, which is why the strict check
+   * exists.
    *
    * Must run *after* [[rollUpFallbackReasons]] for the same operator. The check reads only `op`'s
    * own tag, because `hasFallbackReason` deliberately does not traverse expressions (it is a
-   * planning control signal, not explain output), so an expression-level reason that has not been
-   * lifted yet would be mistaken for no reason at all. [[convertToComet]] is the only production
-   * caller and keeps the two calls together.
+   * planning control signal, not explain output), so a current expression-level write that has
+   * not been lifted yet would be mistaken for no reason at all. [[convertToComet]] is the only
+   * production caller and keeps the two calls together.
    *
    * Package-visible so `CometExecRuleSuite` can drive the strict failure directly: no serde in
    * the tree reaches this state, which is exactly what the check enforces, so the only way to

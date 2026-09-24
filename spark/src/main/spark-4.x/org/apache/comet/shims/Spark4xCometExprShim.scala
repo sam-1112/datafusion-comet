@@ -25,11 +25,10 @@ import org.apache.spark.sql.catalyst.expressions.json.{JsonExpressionUtils, Stru
 import org.apache.spark.sql.catalyst.expressions.objects.{Invoke, StaticInvoke}
 import org.apache.spark.sql.catalyst.expressions.url.ParseUrlEvaluator
 
-import org.apache.comet.CometExplainInfo
 import org.apache.comet.expressions.CometEvalMode
 import org.apache.comet.serde.{CometAggregateExpressionSerde, CometExpressionSerde, CometListAgg, CometMapSort, CometRandStr, CometToPrettyString}
 import org.apache.comet.serde.ExprOuterClass.Expr
-import org.apache.comet.serde.QueryPlanSerde.exprToProtoInternal
+import org.apache.comet.serde.QueryPlanSerde.{captureExpressionFallbackReasons, exprToProtoInternal, liftFallbackReasons}
 
 /**
  * Shared trait body for the Spark 4.x `CometExprShim` traits (4.0/4.1/4.2). Holds the parts that
@@ -78,20 +77,20 @@ trait Spark4xCometExprShim extends CometExprShim4x {
         (i.targetObject, i.functionName, i.arguments) match {
           case (Literal(evaluator: StructsToJsonEvaluator, _), "evaluate", Seq(child)) =>
             val toJson = StructsToJson(evaluator.options, child, evaluator.timeZoneId)
-            val exprProto = exprToProtoInternal(toJson, inputs, binding)
+            val (exprProto, reasons) = captureExpressionFallbackReasons(Seq(toJson)) {
+              exprToProtoInternal(toJson, inputs, binding)
+            }
             if (exprProto.isEmpty) {
-              toJson
-                .getTagValue(CometExplainInfo.FALLBACK_REASONS)
-                .foreach(reasons => i.setTagValue(CometExplainInfo.FALLBACK_REASONS, reasons))
+              liftFallbackReasons(reasons, i)
             }
             exprProto
           case (Literal(evaluator: ParseUrlEvaluator, _), "evaluate", args) =>
             val parseUrl = ParseUrl(args, evaluator.failOnError)
-            val result = exprToProtoInternal(parseUrl, inputs, binding)
+            val (result, reasons) = captureExpressionFallbackReasons(Seq(parseUrl)) {
+              exprToProtoInternal(parseUrl, inputs, binding)
+            }
             if (result.isEmpty) {
-              parseUrl
-                .getTagValue(CometExplainInfo.FALLBACK_REASONS)
-                .foreach(reasons => i.setTagValue(CometExplainInfo.FALLBACK_REASONS, reasons))
+              liftFallbackReasons(reasons, i)
             }
             result
           case _ => None
@@ -101,11 +100,11 @@ trait Spark4xCometExprShim extends CometExprShim4x {
         (s.staticObject, s.functionName, s.arguments) match {
           case (cls, "lengthOfJsonArray", Seq(child)) if cls == classOf[JsonExpressionUtils] =>
             val lengthOfJsonArray = LengthOfJsonArray(child)
-            val exprProto = exprToProtoInternal(lengthOfJsonArray, inputs, binding)
+            val (exprProto, reasons) = captureExpressionFallbackReasons(Seq(lengthOfJsonArray)) {
+              exprToProtoInternal(lengthOfJsonArray, inputs, binding)
+            }
             if (exprProto.isEmpty) {
-              lengthOfJsonArray
-                .getTagValue(CometExplainInfo.FALLBACK_REASONS)
-                .foreach(reasons => s.setTagValue(CometExplainInfo.FALLBACK_REASONS, reasons))
+              liftFallbackReasons(reasons, s)
             }
             exprProto
           case _ => None

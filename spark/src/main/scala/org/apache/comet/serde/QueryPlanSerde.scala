@@ -21,7 +21,6 @@ package org.apache.comet.serde
 
 import java.util.concurrent.atomic.AtomicLong
 
-import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
@@ -38,7 +37,7 @@ import org.apache.spark.sql.types._
 
 import org.apache.comet.CometConf
 import org.apache.comet.CometExplainInfo
-import org.apache.comet.CometSparkSessionExtensions.{appendTagValues, withFallbackReason, withFallbackReasons, withInfo, withNativeExpr}
+import org.apache.comet.CometSparkSessionExtensions.{appendTagValues, captureFallbackReasons, withFallbackReason, withFallbackReasons, withInfo, withNativeExpr}
 import org.apache.comet.expressions._
 import org.apache.comet.parquet.CometParquetUtils
 import org.apache.comet.serde.ExprOuterClass.{AggExpr, Expr, ScalarFunc}
@@ -892,7 +891,12 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       binding: Boolean = true): Option[Expr] = {
 
     val newExpr = DecimalPrecision.promote(expr)
-    val result = exprToProtoInternal(newExpr, inputs, binding)
+    // Snapshot after decimal promotion, because serde walks the rewritten tree. The scoped write
+    // log distinguishes reasons produced by this call from historical tags copied onto shared
+    // Catalyst nodes, including singleton literals. See #5499.
+    val (result, currentFallbackReasons) = captureExpressionFallbackReasons(Seq(newExpr)) {
+      exprToProtoInternal(newExpr, inputs, binding)
+    }
     if (!(newExpr eq expr)) {
       // `promote` rebuilt the tree, so the tags landed on copies that the operator does not hold.
       // Lift them onto `expr` so the roll-ups in `CometExecRule`, which walk the operator's own
@@ -900,7 +904,7 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       // tree and there is nothing to lift.
       liftCoverageTags(newExpr, expr)
       if (result.isEmpty) {
-        liftFallbackReasons(newExpr, expr)
+        liftFallbackReasons(currentFallbackReasons, expr)
       }
     }
     result
@@ -914,24 +918,34 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
   }
 
   /**
-   * Lift fallback reasons recorded anywhere in the rewritten tree onto the original node, so that
-   * `CometExecRule.rollUpFallbackReasons` and extended explain can see them. Without this the
-   * reason is attached to a copy that is not in the plan and is lost entirely - see
-   * https://github.com/apache/datafusion-comet/issues/5230. Same copy-back that the `Invoke` /
-   * `StaticInvoke` rewrites in `Spark4xCometExprShim` do.
+   * Lift fallback reasons written during the current conversion onto the original node, so that
+   * operator roll-up and extended explain can see them. Without this the reason is attached to a
+   * rewritten copy that is not in the plan and is lost entirely - see #5230.
    *
-   * Only called when conversion failed: a fallback reason states why an expression could not be
-   * converted, so lifting one off a tree that converted fine would attribute a stale reason to an
-   * operator that has no problem.
+   * This deliberately accepts the conversion-local write set instead of scanning the rewritten
+   * tree's public `FALLBACK_REASONS` tags. Catalyst TreeNodes can be shared across queries;
+   * reading all accumulated values from a singleton would attribute an unrelated historical
+   * reason to the current owner. Coverage filters such as `isNeverTagged` are not a substitute
+   * because literals can legitimately be the source of a current fallback reason. See #5499.
    */
-  private[serde] def liftFallbackReasons(from: Expression, to: Expression): Unit = {
-    val reasons = mutable.Set.empty[String]
-    from.foreach { e =>
-      e.getTagValue(CometExplainInfo.FALLBACK_REASONS).foreach(reasons ++= _)
-    }
+  private[comet] def liftFallbackReasons(reasons: Set[String], to: Expression): Unit = {
     if (reasons.nonEmpty) {
-      withFallbackReasons(to, reasons.toSet)
+      withFallbackReasons(to, reasons)
     }
+  }
+
+  /**
+   * Capture only fallback-reason writes performed while converting `roots`.
+   *
+   * All existing tags are snapshotted before conversion and are left untouched. The helper also
+   * observes writes to expressions synthesized after the snapshot, and an actual write counts
+   * even when its text already existed. Its metadata lives only for this synchronous conversion
+   * and is removed in `finally`; nothing is stored on shared Catalyst nodes.
+   */
+  private[comet] def captureExpressionFallbackReasons[T](roots: Seq[Expression])(
+      f: => T): (T, Set[String]) = {
+    val nodes = roots.flatMap(_.collect { case e: Expression => e })
+    captureFallbackReasons(nodes)(f)
   }
 
   /**

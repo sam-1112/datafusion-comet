@@ -482,8 +482,12 @@ object ComparisonUtils {
       case _ => value -> list
     }
     val (serializedValue, serializedList) = serializedOperands
-    val valueExpr = exprToProtoInternal(serializedValue, inputs, binding)
-    val listExprs = serializedList.map(exprToProtoInternal(_, inputs, binding))
+    val ((valueExpr, listExprs), currentFallbackReasons) =
+      captureExpressionFallbackReasons(serializedValue +: serializedList) {
+        val valueExpr = exprToProtoInternal(serializedValue, inputs, binding)
+        val listExprs = serializedList.map(exprToProtoInternal(_, inputs, binding))
+        valueExpr -> listExprs
+      }
     if (valueExpr.isDefined && listExprs.forall(_.isDefined)) {
       val builder = ExprOuterClass.In.newBuilder()
       builder.setInValue(valueExpr.get)
@@ -496,10 +500,9 @@ object ComparisonUtils {
           .build())
     } else {
       // Normalization and static-list expansion create temporary wrappers and literals outside the
-      // original tree. Keep their failure reasons on the membership expression so the operator can
-      // explain fallback.
-      liftFallbackReasons(serializedValue, expr)
-      serializedList.foreach(liftFallbackReasons(_, expr))
+      // original tree. Keep only reasons actually written while converting those temporary nodes;
+      // scanning their accumulated tags could pick up history from a shared literal (#5499).
+      liftFallbackReasons(currentFallbackReasons, expr)
       None
     }
   }

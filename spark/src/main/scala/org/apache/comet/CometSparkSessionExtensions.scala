@@ -20,6 +20,9 @@
 package org.apache.comet
 
 import java.nio.ByteOrder
+import java.util.IdentityHashMap
+
+import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.internal.Logging
@@ -114,6 +117,79 @@ class CometSparkSessionExtensions
 }
 
 object CometSparkSessionExtensions extends Logging {
+
+  /**
+   * A fallback-reason write observed during one scoped conversion.
+   *
+   * `previousReasons` is the snapshot taken before that conversion first wrote to `node`. The
+   * write itself remains the provenance signal even when `reasons` was already present in the
+   * snapshot: repeating the same explanation during the current conversion is still proof that
+   * the current conversion diagnosed its fallback.
+   */
+  private case class FallbackReasonWrite(
+      node: TreeNode[_],
+      previousReasons: Set[String],
+      reasons: Set[String])
+
+  private class FallbackReasonCapture(initialNodes: Seq[TreeNode[_]]) {
+    private val snapshots = new IdentityHashMap[TreeNode[_], Set[String]]()
+    private val writes = ArrayBuffer.empty[FallbackReasonWrite]
+
+    initialNodes.foreach(snapshot)
+
+    private def snapshot(node: TreeNode[_]): Set[String] = {
+      var reasons = snapshots.get(node)
+      if (reasons == null) {
+        reasons = node
+          .getTagValue(CometExplainInfo.FALLBACK_REASONS)
+          .getOrElse(Set.empty[String])
+        snapshots.put(node, reasons)
+      }
+      reasons
+    }
+
+    def record(node: TreeNode[_], reasons: Set[String]): Unit = {
+      if (reasons.nonEmpty) {
+        writes += FallbackReasonWrite(node, snapshot(node), reasons)
+      }
+    }
+
+    def writtenReasons: Set[String] = writes.iterator.flatMap(_.reasons).toSet
+  }
+
+  // Conversion is synchronous, but separate queries may plan on separate threads. A ThreadLocal
+  // keeps nested expression/operator captures isolated without putting conversion ids on Catalyst
+  // TreeNodes (especially process-wide singleton literals). The stack is restored in `finally`, so
+  // this process-lifetime holder retains no plan or expression after a conversion completes.
+  private val fallbackReasonCaptures = new ThreadLocal[List[FallbackReasonCapture]] {
+    override def initialValue(): List[FallbackReasonCapture] = Nil
+  }
+
+  /**
+   * Run `f` while recording fallback-reason writes made by this conversion.
+   *
+   * The initial nodes are snapshotted before `f` starts. Nodes synthesized during conversion are
+   * snapshotted immediately before their first write. Unlike a plain before/after `Set`
+   * difference, the write log retains a current write whose text is identical to a pre-existing
+   * reason. See https://github.com/apache/datafusion-comet/issues/5499.
+   */
+  // Public for Comet classes under `org.apache.spark.sql.comet`, which is not nested below this
+  // object's `org.apache.comet` package. This is internal planning machinery, not a user API.
+  def captureFallbackReasons[T](initialNodes: Seq[TreeNode[_]])(f: => T): (T, Set[String]) = {
+    val capture = new FallbackReasonCapture(initialNodes)
+    val previous = fallbackReasonCaptures.get()
+    fallbackReasonCaptures.set(capture :: previous)
+    try {
+      val result = f
+      result -> capture.writtenReasons
+    } finally {
+      if (previous.isEmpty) {
+        fallbackReasonCaptures.remove()
+      } else {
+        fallbackReasonCaptures.set(previous)
+      }
+    }
+  }
   lazy val isBigEndian: Boolean = ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN)
   private val SHUFFLE_MANAGER_KEY = "spark.shuffle.manager"
 
@@ -346,6 +422,11 @@ object CometSparkSessionExtensions extends Logging {
    *   `node` with fallback reasons attached (as a side effect on its tag map).
    */
   def withFallbackReasons[T <: TreeNode[_]](node: T, info: Set[String]): T = {
+    // Notify every active scope before mutating the public tag. Expression conversion can be
+    // nested inside operator conversion; both owners need the same write event. Do not infer an
+    // event by comparing the Set before and after the write, because a serde may legitimately
+    // write the same text that a shared singleton already carries from an unrelated query.
+    fallbackReasonCaptures.get().foreach(_.record(node, info))
     if (CometConf.COMET_EXPLAIN_FALLBACK_LOG_ENABLED.get()) {
       for (reason <- info) {
         logWarning(s"Comet cannot accelerate ${node.getClass.getSimpleName} because: $reason")

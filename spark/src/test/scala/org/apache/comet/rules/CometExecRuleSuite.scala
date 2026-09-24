@@ -24,7 +24,7 @@ import scala.util.Random
 import org.apache.logging.log4j.Level
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.FunctionIdentifier
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, ExpressionInfo, In, InSet, KnownFloatingPointNormalized, Literal, Not}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Expression, ExpressionInfo, In, InSet, KnownFloatingPointNormalized, Literal, Not}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, BloomFilterAggregate, Final, Min, Partial, PartialMerge}
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.comet._
@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.adaptive.{QueryStageExec, ShuffleQueryStag
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DataTypes, DoubleType, FloatType, StructField, StructType}
+import org.apache.spark.sql.types.{DataTypes, DoubleType, FloatType, StructField, StructType, YearMonthIntervalType}
 
 import org.apache.comet.{CometConf, CometExplainInfo, ExtendedExplainInfo}
 import org.apache.comet.CometSparkSessionExtensions.{isSpark35Plus, isSpark40Plus, isSpark42Plus, withFallbackReason}
@@ -356,6 +356,98 @@ class CometExecRuleSuite extends CometTestBase {
             .getTagValue(CometExplainInfo.FALLBACK_REASONS)
             .getOrElse(Set.empty[String])
           assert(reasons == Set(s"${lenientOp.nodeName} is not supported"))
+        }
+      }
+    }
+  }
+
+  test("stale shared-literal reason cannot explain a silent operator fallback") {
+    val planted = Literal.TrueLiteral
+    val previous = planted.getTagValue(CometExplainInfo.FALLBACK_REASONS)
+    val staleReason = "PLANTED_STALE_FALLBACK_REASON"
+    planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, Set(staleReason))
+    try {
+      withTempView("test_data") {
+        createTestDataFrame.createOrReplaceTempView("test_data")
+        val sparkPlan = createSparkPlan(spark, "SELECT id FROM test_data")
+        withSQLConf(CometConf.COMET_EXEC_LOCAL_TABLE_SCAN_ENABLED.key -> "true") {
+          val nativeChild = stripAQEPlan(applyCometExecRule(sparkPlan)).collectFirst {
+            case op: CometNativeExec => op
+          }.get
+          val rule = CometExecRule(spark)
+
+          val strictOp = ProjectExec(Seq(Alias(planted, "flag")()), nativeChild)
+          val e = intercept[IllegalStateException] {
+            rule.handleConversionFailure(strictOp, Set.empty)
+          }
+          assert(e.getMessage.contains("recorded no fallback reason"))
+          assert(!strictOp.getTagValue(CometExplainInfo.FALLBACK_REASONS).exists(_.nonEmpty))
+
+          withSQLConf(CometConf.COMET_STRICT_FALLBACK_REASONS.key -> "false") {
+            val lenientOp = ProjectExec(Seq(Alias(planted, "flag")()), nativeChild)
+            rule.handleConversionFailure(lenientOp, Set.empty)
+            val reasons = lenientOp
+              .getTagValue(CometExplainInfo.FALLBACK_REASONS)
+              .getOrElse(Set.empty[String])
+            assert(reasons == Set(s"${lenientOp.nodeName} is not supported"))
+            assert(!reasons.contains(staleReason))
+          }
+        }
+      }
+    } finally {
+      previous match {
+        case Some(values) => planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, values)
+        case None => planted.unsetTagValue(CometExplainInfo.FALLBACK_REASONS)
+      }
+    }
+  }
+
+  test("a current literal reason remains visible and satisfies strict fallback checking") {
+    withTempView("test_data") {
+      createTestDataFrame.createOrReplaceTempView("test_data")
+      val sparkPlan = createSparkPlan(spark, "SELECT id FROM test_data")
+      withSQLConf(CometConf.COMET_EXEC_LOCAL_TABLE_SCAN_ENABLED.key -> "true") {
+        val nativeChild = stripAQEPlan(applyCometExecRule(sparkPlan)).collectFirst {
+          case op: CometNativeExec => op
+        }.get
+
+        // Unsupported literal datatype: the literal itself is the legitimate reason producer.
+        val unsupported = Literal(1, YearMonthIntervalType())
+        val unsupportedOp = ProjectExec(Seq(Alias(unsupported, "interval")()), nativeChild)
+        val unsupportedPlan = applyCometExecRule(unsupportedOp)
+        val unsupportedReasons = unsupportedPlan
+          .getTagValue(CometExplainInfo.FALLBACK_REASONS)
+          .getOrElse(Set.empty[String])
+        assert(unsupportedReasons.exists(_.contains("Unsupported data type")))
+        assert(unsupported.getTagValue(CometExplainInfo.FALLBACK_REASONS).exists(_.nonEmpty))
+        assert(
+          new ExtendedExplainInfo()
+            .getFallbackReasons(unsupportedPlan)
+            .exists(_.contains("Unsupported data type")))
+
+        // Seed the exact text that disabling Literal will write. Event provenance, unlike a Set
+        // difference, must still recognize the current write and let strict mode proceed.
+        val planted = Literal.TrueLiteral
+        val previous = planted.getTagValue(CometExplainInfo.FALLBACK_REASONS)
+        val key = CometConf.getExprEnabledConfigKey("Literal")
+        val disabledReason = s"Expression support is disabled. Set $key=true to enable it."
+        planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, Set(disabledReason))
+        try {
+          withSQLConf(key -> "false") {
+            val disabledOp = ProjectExec(Seq(Alias(planted, "flag")()), nativeChild)
+            val disabledPlan = applyCometExecRule(disabledOp)
+            val disabledReasons = disabledPlan
+              .getTagValue(CometExplainInfo.FALLBACK_REASONS)
+              .getOrElse(Set.empty[String])
+            assert(disabledReasons == Set(disabledReason))
+            assert(
+              new ExtendedExplainInfo().getFallbackReasons(disabledPlan).contains(disabledReason))
+          }
+        } finally {
+          previous match {
+            case Some(values) => planted.setTagValue(CometExplainInfo.FALLBACK_REASONS, values)
+            case None => planted.unsetTagValue(CometExplainInfo.FALLBACK_REASONS)
+          }
         }
       }
     }
